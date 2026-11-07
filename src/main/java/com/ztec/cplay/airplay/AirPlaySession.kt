@@ -70,6 +70,7 @@ class AirPlaySession(
     internal val activeStreams = linkedSetOf<Int>()
 
     private val closed = AtomicBoolean(false)
+    internal val isClosed: Boolean get() = closed.get()
     private val notified = AtomicBoolean(false)
     private var eventServer: ServerSocket? = null
     private var eventSocket: Socket? = null

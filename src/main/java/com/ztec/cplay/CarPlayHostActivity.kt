@@ -1488,7 +1488,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 .firstOrNull { it.tag == mfiTarget }
             button?.let { group.check(it.id) }
         }
-        
+
         if (remoteMfiServerInput?.text?.toString() != remoteMfiServer) {
             remoteMfiServerInput?.setText(remoteMfiServer)
         }
@@ -2881,9 +2881,12 @@ class CarPlayHostActivity : ComponentActivity() {
 
             override fun onSessionEnded(session: AirPlaySession) {
                 runOnUiThread {
-                    if (activeAirPlaySession === session) activeAirPlaySession = null
-                    CarPlayBackgroundSession.active = false
-                    if (menuOpen || controllerGeneration != restartGeneration) {
+                    val wasActiveSession = activeAirPlaySession === session
+                    if (wasActiveSession) {
+                        activeAirPlaySession = null
+                        CarPlayBackgroundSession.active = false
+                    }
+                    if (!wasActiveSession || menuOpen || controllerGeneration != restartGeneration) {
                         return@runOnUiThread
                     }
                     activeScreenStreamTypes.clear()

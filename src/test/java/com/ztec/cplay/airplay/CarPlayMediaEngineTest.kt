@@ -21,7 +21,7 @@ class CarPlayMediaEngineTest {
     fun screenStreamTeardownReportsInactive() {
         val events = mutableListOf<Pair<Int, Boolean>>()
         val sink = object : MediaSink {
-            override fun onScreenStreamActive(type: Int, active: Boolean) {
+            override fun onScreenStreamActive(session: AirPlaySession, type: Int, active: Boolean) {
                 events += type to active
             }
         }
@@ -42,7 +42,7 @@ class CarPlayMediaEngineTest {
     fun sessionCloseReportsAllScreenStreamsInactive() {
         val events = mutableListOf<Pair<Int, Boolean>>()
         val sink = object : MediaSink {
-            override fun onScreenStreamActive(type: Int, active: Boolean) {
+            override fun onScreenStreamActive(session: AirPlaySession, type: Int, active: Boolean) {
                 events += type to active
             }
         }
@@ -63,6 +63,53 @@ class CarPlayMediaEngineTest {
 
         assertEquals(setOf(110 to false, 111 to false), events.toSet())
         assertTrue(streams.isEmpty())
+    }
+
+
+    @Test
+    fun closedSessionRejectsNewMediaSetupAndFeedback() {
+        val session = testSession()
+        val engine = CarPlayMediaEngine(object : MediaSink {})
+        try {
+            engine.onSessionClosed(session)
+
+            assertEquals(null, engine.onScreen(session, 110, emptyMap()))
+            assertEquals(null, engine.onAudio(session, 100, emptyMap()))
+            assertEquals(null, engine.onDataStream(session, emptyMap()))
+            assertEquals(null, engine.onFeedback(session))
+
+            val streamsField = CarPlayMediaEngine::class.java.getDeclaredField("streams").apply {
+                isAccessible = true
+            }
+            val streams = streamsField.get(engine) as Map<*, *>
+            assertTrue("closed session must not register new streams", streams.isEmpty())
+        } finally {
+            session.close()
+        }
+    }
+
+    @Test
+    fun closingOneSessionPreservesOtherSessionsAudioFeedback() {
+        val first = testSession()
+        val second = testSession()
+        val engine = CarPlayMediaEngine(object : MediaSink {})
+        val field = CarPlayMediaEngine::class.java.getDeclaredField("audioMeta").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val metadata = field.get(engine) as MutableMap<CarPlayMediaEngine.StreamKey, Any>
+        val format = AudioFormat(AudioCodecKind.AAC_LC, 44100, 2, 100)
+        val firstMeta = CarPlayMediaEngine.AudioMeta(100, format, 11L, 0)
+        val secondMeta = CarPlayMediaEngine.AudioMeta(100, format, 22L, 0)
+        metadata[CarPlayMediaEngine.StreamKey(first, 100)] = firstMeta
+        metadata[CarPlayMediaEngine.StreamKey(second, 100)] = secondMeta
+
+        engine.onSessionClosed(first)
+        val feedback = engine.onFeedback(second)
+        assertEquals(1, metadata.size)
+        val feedbackStreams = feedback?.get("streams") as List<*>
+        assertEquals(1, feedbackStreams.size)
+        assertEquals(100, (feedbackStreams.first() as Map<*, *>)["type"])
+        first.close()
+        second.close()
     }
 
     private fun testSession(): AirPlaySession = AirPlaySession(

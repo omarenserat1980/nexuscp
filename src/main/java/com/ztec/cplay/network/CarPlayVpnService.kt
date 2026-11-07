@@ -60,7 +60,7 @@ class CarPlayVpnService : VpnService() {
     private val serverSockets = mutableListOf<ServerSocket>()
     private var bridge: Ipv6NcmBridge? = null
     private var tun: ParcelFileDescriptor? = null
-    private var attachGeneration = 0
+    @Volatile private var attachGeneration = 0
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -226,6 +226,11 @@ class CarPlayVpnService : VpnService() {
         try {
             while (active.get()) {
                 val socket: Socket = server.accept()
+                // Reject sockets returned by a listener that belongs to a replaced attachment.
+                if (!active.get() || generation != attachGeneration) {
+                    runCatching { socket.close() }
+                    return
+                }
                 // The wireless bring-up probes its own port to prove the listener accepts both
                 // address families. Those connections arrive here too, and without this they would
                 // be logged as a real `airplay connection accepted from ...` and spin up a bogus
@@ -246,7 +251,7 @@ class CarPlayVpnService : VpnService() {
                 socket.keepAlive = true
                 socket.setSoLinger(true, 0)
                 val session = synchronized(this) {
-                    if (!active.get()) {
+                    if (!active.get() || generation != attachGeneration) {
                         socket.close()
                         return
                     }

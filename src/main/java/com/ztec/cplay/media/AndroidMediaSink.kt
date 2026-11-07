@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
 import android.view.Surface
+import com.ztec.cplay.airplay.AirPlaySession
 import com.ztec.cplay.airplay.AudioCodecKind
 import com.ztec.cplay.airplay.AudioFormat
 import com.ztec.cplay.airplay.MediaSink
@@ -17,6 +18,8 @@ import com.ztec.cplay.airplay.VideoCodec
 import com.ztec.cplay.airplay.toHexString
 import java.io.Closeable
 import java.nio.ByteBuffer
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Executors
@@ -40,139 +43,268 @@ class AndroidMediaSink(
     private val mediaBufferMillis: Int = MediaAudioBuffer.DEFAULT_MILLIS,
     private val onAudioDiagnostic: (String) -> Unit = {},
 ) : MediaSink {
+    private data class StreamKey(val session: AirPlaySession, val type: Int)
     private val screenStateLock = Any()
-    private val activeScreenTypes = mutableSetOf<Int>()
+    private val sessionLifecycleLock = Any()
+    // Weak tombstones reject late callbacks without retaining every closed session forever.
+    // All accesses happen under sessionLifecycleLock.
+    private val closedSessions = Collections.newSetFromMap(
+        Collections.synchronizedMap(WeakHashMap<AirPlaySession, Boolean>()),
+    )
+    @Volatile private var sinkClosed = false
+    private val activeScreenTypes = mutableSetOf<StreamKey>()
+    // Only one session may own the physical display surface for each screen type.
+    private val videoDisplayOwners = mutableMapOf<Int, AirPlaySession>()
     private val defaultSurface = surface
     @Volatile private var screenStreamActiveChanged = onScreenStreamActiveChanged
     private val surfaces = ConcurrentHashMap<Int, Surface>()
-    private val videoDecoders = ConcurrentHashMap<Int, VideoDecoder>()
-    private val audioRenderers = ConcurrentHashMap<Int, AudioRenderer>()
-    private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
-    private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
-    private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Unit>()
-    private val videoDiagnosticHandlers = ConcurrentHashMap<Int, (String) -> Unit>()
-    private val recoveryPending = AtomicBoolean(false)
+    private val videoDecoders = ConcurrentHashMap<StreamKey, VideoDecoder>()
+    private val audioRenderers = ConcurrentHashMap<StreamKey, AudioRenderer>()
+    private val microphoneUplinks = ConcurrentHashMap<StreamKey, MicrophoneUplink>()
+    private val pendingVideoCodec = ConcurrentHashMap<StreamKey, VideoCodec>()
+    private val videoRecoveryHandlers = ConcurrentHashMap<StreamKey, () -> Unit>()
+    private val videoDiagnosticHandlers = ConcurrentHashMap<StreamKey, (String) -> Unit>()
+    private val recoveryPending = ConcurrentHashMap<StreamKey, AtomicBoolean>()
     private val recoveryExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "carplay-video-recovery").apply { isDaemon = true }
     }
 
-    override fun setVideoRecoveryHandler(type: Int, handler: () -> Unit) {
-        videoRecoveryHandlers[type] = handler
-    }
+    override fun setVideoRecoveryHandler(session: AirPlaySession, type: Int, handler: () -> Unit) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) videoRecoveryHandlers[StreamKey(session, type)] = handler
+        }
 
-    override fun setVideoDiagnosticHandler(type: Int, handler: (String) -> Unit) {
-        videoDiagnosticHandlers[type] = handler
-    }
+    override fun setVideoDiagnosticHandler(session: AirPlaySession, type: Int, handler: (String) -> Unit) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) videoDiagnosticHandlers[StreamKey(session, type)] = handler
+        }
 
-    private fun requestVideoRecovery(type: Int) {
-        if (!recoveryPending.compareAndSet(false, true)) return
+    private fun requestVideoRecovery(key: StreamKey) {
+        // Recovery throttling must be per stream: one stalled session must not suppress
+        // another session's keyframe request.
+        val pending = recoveryPending.computeIfAbsent(key) { AtomicBoolean(false) }
+        if (!pending.compareAndSet(false, true)) return
         try {
             recoveryExecutor.execute {
-                try { videoRecoveryHandlers[type]?.invoke() }
-                catch (error: Exception) { Log.w("nexuscp-usb", "Video keyframe request failed", error) }
-                finally { recoveryPending.set(false) }
+                try {
+                    // Serialize the callback with session teardown. A recovery task may have
+                    // been queued before close(); it must not invoke a stale handler afterward.
+                    synchronized(sessionLifecycleLock) {
+                        if (!sinkClosed && key.session !in closedSessions) {
+                            videoRecoveryHandlers[key]?.invoke()
+                        }
+                    }
+                } catch (error: Exception) {
+                    Log.w("nexuscp-usb", "Video keyframe request failed", error)
+                } finally {
+                    pending.set(false)
+                }
             }
-        } catch (_: java.util.concurrent.RejectedExecutionException) { recoveryPending.set(false) }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { pending.set(false) }
     }
 
     fun setSurface(type: Int, surface: Surface) {
-        surfaces[type] = surface
-        videoDecoders[type]?.setSurface(surface)
+        synchronized(sessionLifecycleLock) {
+            if (sinkClosed) return
+            synchronized(screenStateLock) {
+            surfaces[type] = surface
+            val owner = videoDisplayOwners[type]
+            videoDecoders.filterKeys { it.type == type }.forEach { (key, decoder) ->
+                decoder.setSurface(if (key.session === owner) surface else null)
+            }
+            }
+        }
     }
 
     fun clearSurface(type: Int, surface: Surface) {
-        if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+        synchronized(sessionLifecycleLock) {
+            if (sinkClosed) return
+            synchronized(screenStateLock) {
+            if (surfaces.remove(type, surface)) {
+                // Restore the constructor-provided fallback surface when an Activity-owned
+                // TextureView surface is destroyed; otherwise detach every decoder.
+                val fallback = defaultSurface
+                val owner = videoDisplayOwners[type]
+                videoDecoders.filterKeys { it.type == type }.forEach { (key, decoder) ->
+                    decoder.setSurface(if (key.session === owner) fallback else null)
+                }
+            }
+            }
+        }
     }
 
     fun setScreenStreamActiveChangedListener(listener: ((Int, Boolean) -> Unit)?) {
-        synchronized(screenStateLock) {
+        synchronized(sessionLifecycleLock) {
+            if (sinkClosed) return
+            synchronized(screenStateLock) {
             screenStreamActiveChanged = listener
-            activeScreenTypes.forEach { listener?.invoke(it, true) }
+            activeScreenTypes.map { it.type }.distinct().forEach { listener?.invoke(it, true) }
+            }
         }
     }
 
-    override fun onVideoCodec(type: Int, codec: VideoCodec) {
-        pendingVideoCodec[type] = codec
-    }
+    override fun onVideoCodec(session: AirPlaySession, type: Int, codec: VideoCodec) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) pendingVideoCodec[StreamKey(session, type)] = codec
+        }
 
-    override fun onVideoConfig(type: Int, codecData: ByteArray) {
-        val codec = pendingVideoCodec[type] ?: VideoCodec.H264
-        videoDecoder(type).configure(codec, codecData)
-    }
+    override fun onVideoConfig(session: AirPlaySession, type: Int, codecData: ByteArray) =
+        synchronized(sessionLifecycleLock) {
+            if (sinkClosed || session in closedSessions) return@synchronized
+            val key = StreamKey(session, type)
+            val codec = pendingVideoCodec[key] ?: VideoCodec.H264
+            videoDecoder(key).configure(codec, codecData)
+        }
 
-    override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
-        videoDecoder(type).submit(naluBytes)
-    }
+    override fun onVideoFrame(session: AirPlaySession, type: Int, naluBytes: ByteArray) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) videoDecoder(StreamKey(session, type)).submit(naluBytes)
+        }
 
-    override fun onScreenStreamActive(type: Int, active: Boolean) {
-        if (!active) {
-            videoRecoveryHandlers.remove(type)
-            videoDiagnosticHandlers.remove(type)
-            videoDecoders.remove(type)?.close()
-            pendingVideoCodec.remove(type)
+    override fun onSessionClosed(session: AirPlaySession) = synchronized(sessionLifecycleLock) {
+        closedSessions.add(session)
+        // Include keys that have metadata/handlers but have not created a decoder yet.
+        // A codec announcement or recovery callback can arrive before the first frame.
+        val keys = buildSet {
+            videoDecoders.keys.filterTo(this) { it.session === session }
+            pendingVideoCodec.keys.filterTo(this) { it.session === session }
+            videoRecoveryHandlers.keys.filterTo(this) { it.session === session }
+            videoDiagnosticHandlers.keys.filterTo(this) { it.session === session }
+            recoveryPending.keys.filterTo(this) { it.session === session }
+        }
+        keys.forEach { key -> videoDecoders.remove(key)?.close() }
+        keys.forEach { key ->
+            pendingVideoCodec.remove(key)
+            videoRecoveryHandlers.remove(key)
+            videoDiagnosticHandlers.remove(key)
+            recoveryPending.remove(key)
+        }
+        audioRenderers.keys.filter { it.session === session }.forEach { key ->
+            audioRenderers.remove(key)?.close()
+        }
+        microphoneUplinks.keys.filter { it.session === session }.forEach { key ->
+            microphoneUplinks.remove(key)?.close()
         }
         synchronized(screenStateLock) {
-            if (active) activeScreenTypes.add(type) else activeScreenTypes.remove(type)
-            screenStreamActiveChanged?.invoke(type, active)
+            val affectedTypes = activeScreenTypes.filter { it.session === session }.map { it.type }.toSet()
+            activeScreenTypes.removeAll { it.session === session }
+            affectedTypes.forEach { type ->
+                if (videoDisplayOwners[type] === session) {
+                    val nextOwner = activeScreenTypes.firstOrNull { it.type == type }?.session
+                    if (nextOwner == null) videoDisplayOwners.remove(type) else videoDisplayOwners[type] = nextOwner
+                    val surface = surfaces[type] ?: defaultSurface
+                    videoDecoders.filterKeys { it.type == type }.forEach { (key, decoder) ->
+                        decoder.setSurface(if (key.session === nextOwner) surface else null)
+                    }
+                }
+                if (activeScreenTypes.none { it.type == type }) screenStreamActiveChanged?.invoke(type, false)
+            }
         }
     }
 
-    override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
-        audioRenderer(type, format).start()
+    override fun onScreenStreamActive(session: AirPlaySession, type: Int, active: Boolean) =
+        synchronized(sessionLifecycleLock) {
+            if (active && (sinkClosed || session in closedSessions)) return@synchronized
+            val key = StreamKey(session, type)
+            if (!active) {
+                videoRecoveryHandlers.remove(key)
+                videoDiagnosticHandlers.remove(key)
+                recoveryPending.remove(key)
+                videoDecoders.remove(key)?.close()
+                pendingVideoCodec.remove(key)
+            }
+            synchronized(screenStateLock) {
+                val wasActive = activeScreenTypes.any { it.type == type }
+                if (active) activeScreenTypes.add(key) else activeScreenTypes.remove(key)
+
+                val owner = videoDisplayOwners[type]
+                if (active && owner == null) {
+                    videoDisplayOwners[type] = session
+                } else if (!active && owner === session) {
+                    val nextOwner = activeScreenTypes.firstOrNull { it.type == type }?.session
+                    if (nextOwner == null) videoDisplayOwners.remove(type)
+                    else videoDisplayOwners[type] = nextOwner
+                }
+                val nextOwner = videoDisplayOwners[type]
+                val surface = surfaces[type] ?: defaultSurface
+                videoDecoders.filterKeys { it.type == type }.forEach { (decoderKey, decoder) ->
+                    decoder.setSurface(if (decoderKey.session === nextOwner) surface else null)
+                }
+
+                val isActive = activeScreenTypes.any { it.type == type }
+                if (wasActive != isActive) screenStreamActiveChanged?.invoke(type, isActive)
+            }
+    }
+    override fun onAudioStarted(session: AirPlaySession, type: Int, format: AudioFormat, firstSample: Int) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) audioRenderer(StreamKey(session, type), format).start()
+        }
+
+    override fun onAudioRtp(session: AirPlaySession, type: Int, format: AudioFormat, rtp: ByteArray, sample: Int) =
+        synchronized(sessionLifecycleLock) {
+            if (!sinkClosed && session !in closedSessions) audioRenderer(StreamKey(session, type), format).submit(rtp, sample)
+        }
+
+    override fun onAudioStopped(session: AirPlaySession, type: Int) = synchronized(sessionLifecycleLock) {
+        audioRenderers.remove(StreamKey(session, type))?.close()
     }
 
-    override fun onAudioRtp(type: Int, format: AudioFormat, rtp: ByteArray, sample: Int) {
-        audioRenderer(type, format).submit(rtp, sample)
+    override fun onMicrophoneStarted(session: AirPlaySession, type: Int, config: MicrophoneConfig) =
+        synchronized(sessionLifecycleLock) {
+            if (sinkClosed || session in closedSessions) return@synchronized
+            val key = StreamKey(session, type)
+            val uplink = microphoneUplinks.computeIfAbsent(key) { MicrophoneUplink(config) }
+            if (!uplink.start()) microphoneUplinks.remove(key, uplink)
+        }
+
+    override fun onMicrophoneStopped(session: AirPlaySession, type: Int) = synchronized(sessionLifecycleLock) {
+        microphoneUplinks.remove(StreamKey(session, type))?.close()
     }
 
-    override fun onAudioStopped(type: Int) {
-        audioRenderers.remove(type)?.close()
-    }
-
-    override fun onMicrophoneStarted(type: Int, config: MicrophoneConfig) {
-        val uplink = microphoneUplinks.computeIfAbsent(type) { MicrophoneUplink(config) }
-        if (!uplink.start()) microphoneUplinks.remove(type, uplink)
-    }
-
-    override fun onMicrophoneStopped(type: Int) {
-        microphoneUplinks.remove(type)?.close()
-    }
-
-    fun close() {
+    fun close() = synchronized(sessionLifecycleLock) {
+        if (sinkClosed) return@synchronized
+        sinkClosed = true
         synchronized(screenStateLock) {
-            activeScreenTypes.forEach { screenStreamActiveChanged?.invoke(it, false) }
+            activeScreenTypes.map { it.type }.distinct().forEach { screenStreamActiveChanged?.invoke(it, false) }
             activeScreenTypes.clear()
+            videoDisplayOwners.clear()
             screenStreamActiveChanged = null
         }
         videoDecoders.values.forEach(VideoDecoder::close)
         videoDecoders.clear()
+        pendingVideoCodec.clear()
+        surfaces.clear()
         videoRecoveryHandlers.clear()
         videoDiagnosticHandlers.clear()
+        recoveryPending.clear()
         recoveryExecutor.shutdownNow()
         audioRenderers.values.forEach(AudioRenderer::close)
         audioRenderers.clear()
         microphoneUplinks.values.forEach(MicrophoneUplink::close)
         microphoneUplinks.clear()
+        closedSessions.clear()
     }
 
-    private fun videoDecoder(type: Int): VideoDecoder =
-        videoDecoders.computeIfAbsent(type) {
+    private fun videoDecoder(key: StreamKey): VideoDecoder =
+        videoDecoders.computeIfAbsent(key) {
             VideoDecoder(
-                surfaces[type] ?: defaultSurface,
+                if (synchronized(screenStateLock) { videoDisplayOwners[key.type] === key.session }) {
+                    surfaces[key.type] ?: defaultSurface
+                } else null,
                 videoWidth,
                 videoHeight,
                 preferSoftwareHevcDecoder,
-                requestKeyFrame = { requestVideoRecovery(type) },
-                report = { videoDiagnosticHandlers[type]?.invoke(it) },
+                requestKeyFrame = { requestVideoRecovery(key) },
+                report = { videoDiagnosticHandlers[key]?.invoke(it) },
             )
         }
 
     @Synchronized
-    private fun audioRenderer(type: Int, format: AudioFormat): AudioRenderer {
-        val existing = audioRenderers[type]
-        if (existing?.format == format) return existing
+    private fun audioRenderer(key: StreamKey, format: AudioFormat): AudioRenderer {
+        val existing = audioRenderers[key]
+        if (existing != null && existing.format == format) return existing
         existing?.close()
-        return AudioRenderer(format, advancedAudioChannelMapping, mediaBufferMillis, onAudioDiagnostic).also { audioRenderers[type] = it }
+        return AudioRenderer(format, advancedAudioChannelMapping, mediaBufferMillis, onAudioDiagnostic).also { audioRenderers[key] = it }
     }
 }
 

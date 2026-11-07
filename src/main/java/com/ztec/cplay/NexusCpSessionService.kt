@@ -15,11 +15,13 @@ import com.ztec.cplay.R
 
 /** Keeps an explicitly started connection alive when another car app is in the foreground. */
 class NexusCpSessionService : Service() {
+    @Volatile private var latestStartId = 0
+
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId = startId
         if (intent?.action == ACTION_STOP) {
-            CarPlayBackgroundSession.stop()
-            stopSelf()
+            CarPlayBackgroundSession.stop { stopSelf(startId) }
             return START_NOT_STICKY
         }
         val manager = getSystemService(NotificationManager::class.java)
@@ -54,8 +56,8 @@ class NexusCpSessionService : Service() {
         return START_NOT_STICKY
     }
     override fun onTaskRemoved(rootIntent: Intent?) {
-        CarPlayBackgroundSession.stop()
-        stopSelf()
+        val startId = latestStartId
+        CarPlayBackgroundSession.stop { stopSelf(startId) }
     }
     companion object {
         const val ACTION_STOP = "com.ztec.cplay.DISCONNECT"
