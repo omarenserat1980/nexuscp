@@ -35,12 +35,6 @@ android {
     }
 
     signingConfigs {
-        getByName("debug") {
-            storeFile = file(prop("debug.storeFile", "ANDROID_DEBUG_KEYSTORE_PATH", "keystore/nexuscp-debug.jks"))
-            storePassword = prop("debug.storePassword", "ANDROID_DEBUG_KEYSTORE_PASSWORD")
-            keyAlias = prop("debug.keyAlias", "ANDROID_DEBUG_KEY_ALIAS", "nexuscp-debug")
-            keyPassword = prop("debug.keyPassword", "ANDROID_DEBUG_KEY_PASSWORD")
-        }
         create("release") {
             storeFile = file(prop("release.storeFile", "ANDROID_KEYSTORE_PATH", "keystore/nexuscp-release.jks"))
             storePassword = prop("release.storePassword", "ANDROID_KEYSTORE_PASSWORD")
@@ -50,9 +44,6 @@ android {
     }
 
     buildTypes {
-        debug {
-            signingConfig = signingConfigs.getByName("debug")
-        }
         release {
             optimization {
                 enable = false

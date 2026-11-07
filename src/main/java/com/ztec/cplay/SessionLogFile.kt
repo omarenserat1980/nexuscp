@@ -19,7 +19,8 @@ internal class SessionLogFile(val file: File) : Closeable {
     fun append(line: String) = synchronized(lock) {
         if (closed) return@synchronized
         val safe = DiagnosticRedactor.redact(line) ?: return@synchronized
-        Log.d(LogCarDiagnose.TAG, safe)
+        // Android Log is unavailable in local JVM unit tests.
+        runCatching { Log.d(LogCarDiagnose.TAG, safe) }
         runCatching {
             if (file.length() > MAX_BYTES) {
                 rotate()
