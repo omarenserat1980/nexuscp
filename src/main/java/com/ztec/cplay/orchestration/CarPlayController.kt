@@ -1732,6 +1732,8 @@ class CarPlayController(
                     if (remaining <= 0L) break
                     lock.wait(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
                 }
+            } catch (security: SecurityException) {
+                debugLog("Wireless reset: missing permission for requestGroupInfo", security)
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
             } catch (error: Exception) {

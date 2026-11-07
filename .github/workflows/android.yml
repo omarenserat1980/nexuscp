@@ -24,6 +24,16 @@ jobs:
         run: echo "NEXUSCP_BUILD_NUMBER=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
       - name: Unit tests and lint
         run: ./gradlew testDebugUnitTest lintDebug --stacktrace
+      - name: Upload lint reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexuscp-lint-reports
+          path: |
+            build/reports/lint-results-debug.html
+            build/reports/lint-results-debug.sarif
+            build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/lint-results-debug.txt
+          if-no-files-found: warn
       - name: Debug APK
         run: ./gradlew assembleDebug --stacktrace
       - name: Verify debug APK
