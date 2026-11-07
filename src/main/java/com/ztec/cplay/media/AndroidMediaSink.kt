@@ -245,10 +245,11 @@ class AndroidMediaSink(
             if (!sinkClosed && session !in closedSessions) audioRenderer(StreamKey(session, type), format).submit(rtp, sample)
         }
 
-    override fun onAudioStopped(session: AirPlaySession, type: Int) = synchronized(sessionLifecycleLock) {
-        audioRenderers.remove(StreamKey(session, type))?.close()
+    override fun onAudioStopped(session: AirPlaySession, type: Int) {
+        synchronized(sessionLifecycleLock) {
+            audioRenderers.remove(StreamKey(session, type))?.close()
+        }
     }
-
     override fun onMicrophoneStarted(session: AirPlaySession, type: Int, config: MicrophoneConfig) =
         synchronized(sessionLifecycleLock) {
             if (sinkClosed || session in closedSessions) return@synchronized
@@ -257,10 +258,11 @@ class AndroidMediaSink(
             if (!uplink.start()) microphoneUplinks.remove(key, uplink)
         }
 
-    override fun onMicrophoneStopped(session: AirPlaySession, type: Int) = synchronized(sessionLifecycleLock) {
-        microphoneUplinks.remove(StreamKey(session, type))?.close()
+    override fun onMicrophoneStopped(session: AirPlaySession, type: Int) {
+        synchronized(sessionLifecycleLock) {
+            microphoneUplinks.remove(StreamKey(session, type))?.close()
+        }
     }
-
     fun close() = synchronized(sessionLifecycleLock) {
         if (sinkClosed) return@synchronized
         sinkClosed = true

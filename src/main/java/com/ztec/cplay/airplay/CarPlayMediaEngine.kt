@@ -165,13 +165,14 @@ class CarPlayMediaEngine(
         val audio = AudioStream(key, type, session::logDebug)
         val (dataPort, controlPort) = audio.listen(
             object : AudioStream.Listener {
-                override fun onStarted(firstSample: Int) = withOpenSession(session, Unit) {
-                    meta.firstSample = firstSample
-                    meta.originNs = System.nanoTime()
-                    sink.onAudioStarted(session, type, format, firstSample)
-                    microphone?.let { sink.onMicrophoneStarted(session, type, it) }
+                override fun onStarted(firstSample: Int) {
+                    withOpenSession(session, Unit) {
+                        meta.firstSample = firstSample
+                        meta.originNs = System.nanoTime()
+                        sink.onAudioStarted(session, type, format, firstSample)
+                        microphone?.let { sink.onMicrophoneStarted(session, type, it) }
+                    }
                 }
-
                 override fun onRtp(rtp: ByteArray, sample: Int) = withOpenSession(session, Unit) {
                     sink.onAudioRtp(session, type, format, rtp, sample)
                 }
@@ -181,8 +182,10 @@ class CarPlayMediaEngine(
                     rtp: ByteArray?,
                     sample: Int?,
                     error: Throwable?,
-                ) = withOpenSession(session, Unit) {
-                    capture?.record(wire, rtp, sample, error)
+                ) {
+                    withOpenSession(session, Unit) {
+                        capture?.record(wire, rtp, sample, error)
+                    }
                 }
             },
         )
