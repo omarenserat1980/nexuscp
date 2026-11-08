@@ -73,10 +73,17 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
 
         try {
             ensureStartActive(attempt)
-            wifiManager.startLocalOnlyHotspot(
-                createCallback(attempt),
-                Handler(thread.looper),
-            )
+            try {
+                wifiManager.startLocalOnlyHotspot(
+                    createCallback(attempt),
+                    Handler(thread.looper),
+                )
+            } catch (security: SecurityException) {
+                throw IOException(
+                    "Android denied LocalOnlyHotspot access. Check nearby-device and location permissions.",
+                    security,
+                )
+            }
 
             val activeReservation = awaitStart(attempt, deadlineNanos, timeoutMillis)
             acquiredMulticastLock = acquireMulticastLock(attempt)
@@ -134,10 +141,11 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
         }
 
         releaseMulticastLock(activeMulticastLock)
-        activeReservation?.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activeReservation?.close()
         activeCallbackThread?.quitSafely()
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun createCallback(attempt: StartAttempt): WifiManager.LocalOnlyHotspotCallback =
         object : WifiManager.LocalOnlyHotspotCallback() {
             override fun onStarted(
@@ -226,6 +234,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun readConfiguration(
         reservation: WifiManager.LocalOnlyHotspotReservation,
     ): HotspotConfiguration {
@@ -523,7 +532,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
             failedThread = attempt.thread
         }
         releaseMulticastLock(multicastLock)
-        failedReservation?.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) failedReservation?.close()
         failedThread?.quitSafely()
     }
 

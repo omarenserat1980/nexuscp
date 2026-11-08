@@ -184,13 +184,20 @@ class WifiP2pGroupManager(
                     val usingRemembered = preferred?.request == selection
                     if (usingRemembered) synchronized(stateLock) { rememberedAttempt = preferred }
                     try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            p2pManager.createGroup(p2pChannel, config, createActionListener(attempt, request))
-                        } else {
-                            // createGroup(Channel, WifiP2pConfig, ActionListener) is API 29. Android 7
-                            // through 9 use the original overload, which has the platform generate
-                            // the group SSID, passphrase and channel.
-                            p2pManager.createGroup(p2pChannel, createActionListener(attempt, request))
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                p2pManager.createGroup(p2pChannel, config, createActionListener(attempt, request))
+                            } else {
+                                // createGroup(Channel, WifiP2pConfig, ActionListener) is API 29. Android 7
+                                // through 9 use the original overload, which has the platform generate
+                                // the group SSID, passphrase and channel.
+                                p2pManager.createGroup(p2pChannel, createActionListener(attempt, request))
+                            }
+                        } catch (security: SecurityException) {
+                            throw IOException(
+                                "Wi-Fi Direct access was denied. Allow Nearby devices for Nexus CP.",
+                                security,
+                            )
                         }
                         awaitGroupCreated(attempt, request, deadlineNanos, timeoutMillis)
                     } catch (failure: P2pCreateRejected) {
@@ -465,11 +472,14 @@ class WifiP2pGroupManager(
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(GROUP_SCAN_BUDGET_MILLIS)
             runCatching { @Suppress("DEPRECATION") wifi.startScan() }
             while (true) {
-                val scanned = runCatching {
+                val scanned = try {
                     wifi.scanResults
                         ?.firstOrNull { it.SSID == groupSsid && it.frequency > 0 }
                         ?.frequency
-                }.getOrNull()
+                } catch (security: SecurityException) {
+                    diagnostic("Wi-Fi P2P scan results unavailable: permission denied")
+                    null
+                }
                 if (scanned != null && wifiFrequencyMhzToChannel(scanned) != null) {
                     diagnostic("Wi-Fi P2P group channel observed by scan channel=${wifiFrequencyMhzToChannel(scanned)}")
                     return scanned
@@ -492,9 +502,13 @@ class WifiP2pGroupManager(
     ): WifiP2pGroup? {
         val result = AtomicReference<WifiP2pGroup?>()
         val latch = CountDownLatch(1)
-        p2pManager.requestGroupInfo(channel) {
-            result.set(it)
-            latch.countDown()
+        try {
+            p2pManager.requestGroupInfo(channel) {
+                result.set(it)
+                latch.countDown()
+            }
+        } catch (security: SecurityException) {
+            throw IOException("Wi-Fi Direct group information permission was denied", security)
         }
         if (!await(latch, timeoutNanos)) {
             if (requireResponse) throw IOException("Wi-Fi Direct did not respond")
@@ -545,6 +559,9 @@ class WifiP2pGroupManager(
                 result.set(group?.clientList?.size ?: 0)
                 latch.countDown()
             }
+        } catch (security: SecurityException) {
+            Log.w(TAG, "Wi-Fi P2P client count permission was denied", security)
+            return null
         } catch (error: Exception) {
             Log.w(TAG, "Wi-Fi P2P client count request failed", error)
             return null

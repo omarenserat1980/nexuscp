@@ -1,6 +1,9 @@
 package com.ztec.cplay.orchestration
 
+import android.annotation.SuppressLint
+import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.content.pm.PackageManager
 import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHeadset
@@ -1746,47 +1749,60 @@ class CarPlayController(
     private fun isStaleWirelessRun(generation: Int): Boolean =
         closed || phase != Phase.WIRELESS || generation != wirelessGeneration.get()
 
+    @SuppressLint("MissingPermission")
     private fun selectWirelessBluetoothDevice(adapter: BluetoothAdapter): BluetoothDevice {
-        val bonded = adapter.bondedDevices.orEmpty()
-        config.wirelessBluetoothDeviceAddress?.let { selected ->
-            return bonded.firstOrNull { it.address.equals(selected, ignoreCase = true) }
-                ?: throw IOException("The selected iPhone is no longer paired. Choose it again in Nexus CP.")
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            throw IOException("Allow Nearby devices for Nexus CP, then reconnect CarPlay.")
         }
-        val iPhones = bonded.filter { device ->
-            device.name?.contains("iPhone", ignoreCase = true) == true
-        }
-        val directlyConnectedIPhones = iPhones.filter(::isBluetoothDeviceConnected)
-        Log.i(
-            IphoneCarPlayConfiguration.TAG,
-            "wireless Bluetooth bondedIPhones=${iPhones.size} " +
-                "directlyConnected=${directlyConnectedIPhones.size}",
-        )
-        val connectedIPhones = if (directlyConnectedIPhones.isNotEmpty()) {
-            directlyConnectedIPhones
-        } else {
-            val connectedAddresses = connectedBluetoothDevices(adapter).mapTo(mutableSetOf()) {
-                it.address
+
+        return try {
+            val bonded = adapter.bondedDevices.orEmpty()
+            config.wirelessBluetoothDeviceAddress?.let { selected ->
+                return bonded.firstOrNull { it.address.equals(selected, ignoreCase = true) }
+                    ?: throw IOException("The selected iPhone is no longer paired. Choose it again in Nexus CP.")
             }
-            iPhones.filter { it.address in connectedAddresses }
-        }
-        if (connectedIPhones.size == 1) return connectedIPhones.single()
-        if (connectedIPhones.size > 1) {
-            throw IOException(
-                "Multiple connected iPhones found: " +
-                    connectedIPhones.joinToString { "${it.name ?: "iPhone"} (${it.address})" },
+            val iPhones = bonded.filter { device ->
+                device.name?.contains("iPhone", ignoreCase = true) == true
+            }
+            val directlyConnectedIPhones = iPhones.filter(::isBluetoothDeviceConnected)
+            Log.i(
+                IphoneCarPlayConfiguration.TAG,
+                "wireless Bluetooth bondedIPhones=${iPhones.size} " +
+                    "directlyConnected=${directlyConnectedIPhones.size}",
             )
-        }
-        if (iPhones.size == 1) return iPhones.single()
-        if (iPhones.size > 1) {
+            val connectedIPhones = if (directlyConnectedIPhones.isNotEmpty()) {
+                directlyConnectedIPhones
+            } else {
+                val connectedAddresses = connectedBluetoothDevices(adapter).mapTo(mutableSetOf()) {
+                    it.address
+                }
+                iPhones.filter { it.address in connectedAddresses }
+            }
+            if (connectedIPhones.size == 1) return connectedIPhones.single()
+            if (connectedIPhones.size > 1) {
+                throw IOException(
+                    "Multiple connected iPhones found: " +
+                        connectedIPhones.joinToString { "${it.name ?: "iPhone"} (${it.address})" },
+                )
+            }
+            if (iPhones.size == 1) return iPhones.single()
+            if (iPhones.size > 1) {
+                throw IOException(
+                    "Multiple bonded iPhones found and none is currently connected; " +
+                        "connect one iPhone and retry",
+                )
+            }
+            if (bonded.size == 1) return bonded.single()
             throw IOException(
-                "Multiple bonded iPhones found and none is currently connected; " +
-                    "connect one iPhone and retry",
+                "No unambiguous bonded iPhone found; pair one iPhone and retry",
             )
+        } catch (security: SecurityException) {
+            throw IOException("Bluetooth access was denied. Allow Nearby devices for Nexus CP.", security)
         }
-        if (bonded.size == 1) return bonded.single()
-        throw IOException(
-            "No unambiguous bonded iPhone found; pair one iPhone and retry",
-        )
     }
 
     private fun connectBluetoothSocket(socket: BluetoothSocket, address: String) {
@@ -1911,17 +1927,15 @@ class CarPlayController(
 
     @Suppress("DEPRECATION")
     private fun accessoryBluetoothMac(adapter: BluetoothAdapter): String {
-        val address = try {
-            adapter.address
-        } catch (_: SecurityException) {
-            null
-        }
+        // BluetoothAdapter.address is LOCAL_MAC_ADDRESS-protected on modern Android and
+        // ordinary applications cannot request that privileged permission. Use the OS setting
+        // only when the vendor exposes it; otherwise retain the configured accessory identity.
         val settingsAddress = try {
             Settings.Secure.getString(appContext.contentResolver, "bluetooth_address")
         } catch (_: SecurityException) {
             null
         }
-        return listOfNotNull(address, settingsAddress)
+        return listOfNotNull(settingsAddress)
             .firstOrNull {
                 BLUETOOTH_ADDRESS.matches(it) &&
                     !it.equals(ADAPTER_ADDRESS_PLACEHOLDER, ignoreCase = true)

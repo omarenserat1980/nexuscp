@@ -504,16 +504,16 @@ class NexusCpActivity : ComponentActivity() {
         val channel = manager.initialize(this, mainLooper, null)
         try {
             manager.requestGroupInfo(channel) { group ->
-                if (group == null) { channel.close(); connect(true); return@requestGroupInfo }
+                if (group == null) { closeP2pChannel(channel); connect(true); return@requestGroupInfo }
                 manager.removeGroup(channel, object : android.net.wifi.p2p.WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         val deadline = android.os.SystemClock.elapsedRealtime() + 4000
                         fun waitUntilRemoved() {
                             manager.requestGroupInfo(channel) { remaining ->
                                 when {
-                                    remaining == null -> { channel.close(); if (!isFinishing && !isDestroyed) connect(true) }
+                                    remaining == null -> { closeP2pChannel(channel); if (!isFinishing && !isDestroyed) connect(true) }
                                     android.os.SystemClock.elapsedRealtime() >= deadline -> {
-                                        channel.close(); toast(getString(R.string.wifi_direct_busy))
+                                        closeP2pChannel(channel); toast(getString(R.string.wifi_direct_busy))
                                     }
                                     else -> handler.postDelayed({ waitUntilRemoved() }, 200)
                                 }
@@ -521,12 +521,17 @@ class NexusCpActivity : ComponentActivity() {
                         }
                         waitUntilRemoved()
                     }
-                    override fun onFailure(reason: Int) { channel.close(); toast(getString(R.string.cannot_reset_wifi_direct)) }
+                    override fun onFailure(reason: Int) { closeP2pChannel(channel); toast(getString(R.string.cannot_reset_wifi_direct)) }
                 })
             }
         } catch (_: SecurityException) {
-            channel.close(); permissionHelp(getString(R.string.nearby_devices_permission_title), getString(R.string.wireless_permission_hint))
+            closeP2pChannel(channel); permissionHelp(getString(R.string.nearby_devices_permission_title), getString(R.string.wireless_permission_hint))
         }
+    }
+
+    private fun closeP2pChannel(channel: android.net.wifi.p2p.WifiP2pManager.Channel) {
+        // Channel.close() was added in API 27; older releases expose no public close method.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) channel.close()
     }
 
     private fun refreshStatus() {

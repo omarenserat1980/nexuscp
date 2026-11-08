@@ -77,6 +77,11 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
                 )
                 .setBufferSizeInBytes(bufferSize)
                 .build()
+        } catch (security: SecurityException) {
+            Log.w(TAG, "microphone permission was denied; RECORD_AUDIO is required", security)
+            nextEncoder?.close()
+            running.set(false)
+            return false
         } catch (error: Exception) {
             Log.e(TAG, "microphone recorder creation failed", error)
             nextEncoder?.close()
