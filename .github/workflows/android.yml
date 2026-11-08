@@ -1,7 +1,7 @@
 name: Android checks
 on:
   push:
-    branches: [master, main, nexuscp/session-isolation-v19]
+    branches: [master, main, nexuscp/session-isolation-v19, fix/**]
   pull_request:
   workflow_dispatch:
 permissions:
