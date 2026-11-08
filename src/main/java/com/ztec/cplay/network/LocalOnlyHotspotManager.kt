@@ -148,6 +148,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
     @RequiresApi(Build.VERSION_CODES.O)
     private fun createCallback(attempt: StartAttempt): WifiManager.LocalOnlyHotspotCallback =
         object : WifiManager.LocalOnlyHotspotCallback() {
+            @RequiresApi(Build.VERSION_CODES.O)
             override fun onStarted(
                 reservation: WifiManager.LocalOnlyHotspotReservation,
             ) {
